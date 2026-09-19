@@ -19,8 +19,9 @@ AXIS = {"U": 0, "D": 0, "L": 1, "R": 1, "F": 2, "B": 2}
 SUFFIX = ["", "'", "2"]
 SCRAMBLE_LEN = {"2x2": 11, "3x3": 20, "4x4": 40, "5x5": 60}
 
-HOLD_TO_ARM = 0.40   # how long space must be held before the timer is armed
-RELEASE_GAP = 0.12   # no key repeat for this long means the key came up
+RELEASE_GAP = 0.12    # no key repeat for this long means the key came up
+INSPECTION = 15.0     # WCA inspection; over it is +2, over the limit below is DNF
+INSPECTION_DNF = 17.0
 
 
 # --- solve model ---------------------------------------------------------
@@ -287,14 +288,14 @@ class App:
         self.args = args
         self.solves = load(args.session)
         self.scramble = scramble(args.puzzle)
-        self.state = "idle"        # idle | hold | armed | running
-        self.hold_since = 0.0
+        self.state = "idle"        # idle | inspect | running
+        self.inspect_since = 0.0
         self.last_space = 0.0
         self.started = 0.0
-        self.elapsed = 0.0
         self.message = ""
         self.show_help = False
-        self.inspection_left = None
+        self.inspection = not args.no_inspection
+        self.cursor = None         # index into self.solves; None follows the newest
 
     # -- state machine ---------------------------------------------------
 
@@ -302,52 +303,88 @@ class App:
         if self.state == "running":
             self.stop(now)
         elif self.state == "idle":
-            self.state = "hold"
-            self.hold_since = now
+            self.state = "inspect"
+            self.inspect_since = now
             self.last_space = now
             self.message = ""
-        else:
+        else:  # key repeat while the bar is still down
             self.last_space = now
 
     def tick(self, now):
-        """Advance hold / release logic between keypresses."""
-        if self.state == "hold" and now - self.hold_since >= HOLD_TO_ARM:
-            self.state = "armed"
-        if self.state in ("hold", "armed") and now - self.last_space >= RELEASE_GAP:
-            if self.state == "armed":
-                self.start(now)
-            else:  # released too early: treat as a tap, so a quick press still works
-                self.start(now)
+        """Space came up when the key repeat stops."""
+        if self.state == "inspect" and now - self.last_space >= RELEASE_GAP:
+            self.start(now)
+
+    def inspection_penalty(self, now):
+        """WCA: over 15s is +2, over 17s is a DNF."""
+        if not self.inspection:
+            return ""
+        used = now - self.inspect_since
+        if used > INSPECTION_DNF:
+            return DNF
+        return "+2" if used > INSPECTION else ""
 
     def start(self, now):
+        self.pending_penalty = self.inspection_penalty(now)
         self.state = "running"
         self.started = now
-        self.elapsed = 0.0
 
     def stop(self, now):
-        self.elapsed = now - self.started
         self.state = "idle"
-        solve = Solve(self.elapsed, self.scramble)
+        solve = Solve(now - self.started, self.scramble, self.pending_penalty)
         self.solves.append(solve)
+        self.cursor = None
         save(self.args.session, self.solves)
         st = session_stats(self.solves)
-        if st["best"] is not None and abs(solve.value - st["best"]) < 1e-9 and len(self.solves) > 1:
+        if self.pending_penalty:
+            self.message = f"inspection {self.pending_penalty}"
+        elif st["best"] is not None and abs(solve.value - st["best"]) < 1e-9 and len(self.solves) > 1:
             self.message = "new personal best"
         else:
             self.message = ""
         self.scramble = scramble(self.args.puzzle)
+
+    # -- selection -------------------------------------------------------
+
+    @property
+    def selected(self):
+        """Index of the solve the keys act on: the cursor, else the newest."""
+        if not self.solves:
+            return None
+        return len(self.solves) - 1 if self.cursor is None else self.cursor
+
+    def move_cursor(self, step):
+        if not self.solves:
+            return
+        self.cursor = min(max((self.selected or 0) + step, 0), len(self.solves) - 1)
+        if self.cursor == len(self.solves) - 1:
+            self.cursor = None  # snap back to following the newest solve
 
     # -- drawing ---------------------------------------------------------
 
     def timer_text(self, now):
         if self.state == "running":
             return fmt(now - self.started)
+        if self.state == "inspect":
+            if not self.inspection:
+                return "0.00"
+            left = INSPECTION - (now - self.inspect_since)
+            return f"{max(left, 0):.0f}" if left > -2 else "DNF"
         if self.solves:
-            return self.solves[-1].display()
+            return self.solves[self.selected].display()
         return "0.00"
 
     def timer_colour(self):
-        return {"hold": C_BAD, "armed": C_GOOD, "running": C_ACCENT}.get(self.state, C_DIM)
+        if self.state == "running":
+            return C_ACCENT
+        if self.state == "inspect":
+            if not self.inspection:
+                return C_GOOD
+            used = time.monotonic() - self.inspect_since
+            if used > INSPECTION_DNF:
+                return C_BAD
+            return C_WARN if used > INSPECTION - 7 else C_GOOD
+        return C_DIM
 
     def draw(self, now):
         screen = self.screen
@@ -387,12 +424,16 @@ class App:
             if first + i < top + timer_h - 1:
                 centre(screen, first + i, main_w, row, colour, 1)
 
-        status = {
-            "idle": "hold space, release to start",
-            "hold": "keep holding…",
-            "armed": "release to go",
-            "running": "press any key to stop",
-        }[self.state]
+        if self.state == "inspect" and self.inspection:
+            used = now - self.inspect_since
+            status = ("inspection — release to start" if used <= INSPECTION else
+                      "over 15s: +2" if used <= INSPECTION_DNF else "over 17s: DNF")
+        else:
+            status = {
+                "idle": "hold space for inspection, release to start",
+                "inspect": "release to start",
+                "running": "press any key to stop",
+            }[self.state]
         centre(screen, top + timer_h - 2, main_w, status,
                curses.color_pair(self.timer_colour()) | curses.A_DIM, 1)
         if self.message:
@@ -422,14 +463,25 @@ class App:
 
         # history column
         if side:
-            box(screen, top, width - side - 1, height - top - 1, side, "history", C_DIM)
+            rows = height - top - 3
+            box(screen, top, width - side - 1, height - top - 1, side,
+                "history  ↑↓ select", C_DIM)
             best = st["best"]
-            recent = list(enumerate(self.solves, 1))[-(height - top - 3):]
-            for i, (num, solve) in enumerate(recent):
+            chosen = self.selected
+            # Keep the selected solve in view while scrolling through a long session.
+            end = min(len(self.solves), max(chosen + 1, rows)) if chosen is not None else 0
+            start = max(0, end - rows)
+            for i, index in enumerate(range(start, end)):
+                solve = self.solves[index]
                 mark = "*" if best is not None and solve.value == best else " "
-                attr = curses.color_pair(C_GOOD) if mark == "*" else curses.color_pair(C_DIM)
+                if index == chosen:
+                    attr = curses.color_pair(C_ACCENT) | curses.A_REVERSE | curses.A_BOLD
+                elif mark == "*":
+                    attr = curses.color_pair(C_GOOD)
+                else:
+                    attr = curses.color_pair(C_DIM)
                 put(screen, top + 1 + i, width - side + 1,
-                    f"{num:>4}.{mark}{solve.display():>9}", attr)
+                    f"{index + 1:>4}.{mark}{solve.display():>9} ", attr)
 
         if self.show_help:
             self.draw_help(height, width)
@@ -437,23 +489,26 @@ class App:
 
     def draw_help(self, height, width):
         rows = [
-            ("space", "hold, then release to start; any key stops"),
-            ("p", "toggle +2 on the last solve"),
-            ("d", "toggle DNF on the last solve"),
-            ("x", "delete the last solve"),
+            ("space", "hold for inspection, release to start; any key stops"),
+            ("↑ ↓ / k j", "pick a solve in the history"),
+            ("g", "jump back to the newest solve"),
+            ("x / del", "delete the picked solve"),
+            ("p", "toggle +2 on the picked solve"),
+            ("d", "toggle DNF on the picked solve"),
+            ("i", "inspection countdown on / off"),
             ("n", "new scramble"),
             ("?", "close this help"),
             ("q", "quit"),
         ]
-        w, h = 52, len(rows) + 4
+        w, h = 60, len(rows) + 4
         top, left = (height - h) // 2, (width - w) // 2
         for row in range(h):  # clear the area behind the panel
             put(self.screen, top + row, left, " " * w)
         box(self.screen, top, left, h, w, "keys", C_TITLE)
         for i, (key, text) in enumerate(rows):
-            put(self.screen, top + 2 + i, left + 3, f"{key:<7}",
+            put(self.screen, top + 2 + i, left + 3, f"{key:<11}",
                 curses.color_pair(C_ACCENT) | curses.A_BOLD)
-            put(self.screen, top + 2 + i, left + 11, text, curses.color_pair(C_DIM))
+            put(self.screen, top + 2 + i, left + 15, text, curses.color_pair(C_DIM))
 
     # -- input -----------------------------------------------------------
 
@@ -461,21 +516,33 @@ class App:
         if self.state == "running":
             self.stop(now)
             return True
-        if key in (ord(" "),):
+        if key == ord(" "):
             self.on_space(now)
         elif key in (ord("q"), 27):
             return False
         elif key == ord("?"):
             self.show_help = not self.show_help
+        elif key in (curses.KEY_UP, ord("k")):
+            self.cursor = None if not self.solves else max((self.selected or 0) - 1, 0)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.move_cursor(1)
+        elif key == ord("g"):
+            self.cursor = None
+        elif key == ord("i"):
+            self.inspection = not self.inspection
+            self.message = f"inspection {'on' if self.inspection else 'off'}"
         elif key in (ord("p"), ord("d")) and self.solves:
             want = "+2" if key == ord("p") else DNF
-            last = self.solves[-1]
-            last.penalty = "" if last.penalty == want else want
+            solve = self.solves[self.selected]
+            solve.penalty = "" if solve.penalty == want else want
             save(self.args.session, self.solves)
-        elif key == ord("x") and self.solves:
-            gone = self.solves.pop()
+            self.message = f"#{self.selected + 1} → {solve.display()}"
+        elif key in (ord("x"), curses.KEY_DC, curses.KEY_BACKSPACE, 127) and self.solves:
+            index = self.selected
+            gone = self.solves.pop(index)
+            self.cursor = None if index >= len(self.solves) else index
             save(self.args.session, self.solves)
-            self.message = f"deleted {gone.display()}"
+            self.message = f"deleted #{index + 1}  {gone.display()}"
         elif key == ord("n"):
             self.scramble = scramble(self.args.puzzle)
         return True
@@ -532,6 +599,8 @@ def main():
     parser.add_argument("-s", "--session", default="default", help="session name")
     parser.add_argument("-p", "--puzzle", default="3x3", choices=sorted(SCRAMBLE_LEN),
                         help="puzzle type (scramble length)")
+    parser.add_argument("-I", "--no-inspection", action="store_true",
+                        help="skip the 15 second inspection countdown")
     parser.add_argument("--stats", action="store_true", help="print stats and exit")
     parser.add_argument("--history", type=int, nargs="?", const=20, metavar="N",
                         help="print the last N solves and exit")

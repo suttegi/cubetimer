@@ -24,9 +24,11 @@ penalties and session history — in one Python file with no dependencies.
  ╰──────────────────────────────────────────╯╰──────────────────╯
 ```
 
-The digits are tabular, so centiseconds never shift the layout while you solve. The panel
-turns red while you hold the space bar and green the moment the timer is armed, the way a
-proper cubing timer behaves.
+The digits are tabular, so centiseconds never shift the layout while you solve.
+
+Hold the space bar and the **15 second WCA inspection** counts down in big digits: green,
+amber from 8 seconds, red once you are over. Release and the stopwatch starts. Going past
+15 seconds gives the solve a +2, past 17 a DNF, exactly as it would at a competition.
 
 ## Install
 
@@ -49,25 +51,31 @@ It stays a symlink, so `git pull` updates the command too.
 
 ## Use
 
-Hold `space`, release to start, press any key to stop. That is the whole loop.
+Hold `space` for inspection, release to start, press any key to stop. That is the loop.
 
 | Key | Action |
 | --- | --- |
-| `space` | hold, release to start; any key stops |
-| `p` | toggle +2 on the last solve |
-| `d` | toggle DNF on the last solve |
-| `x` | delete the last solve |
+| `space` | hold for inspection, release to start; any key stops |
+| `↑` `↓` / `k` `j` | pick any solve in the history |
+| `g` | jump back to the newest solve |
+| `x` / `delete` | delete the picked solve |
+| `p` | toggle +2 on the picked solve |
+| `d` | toggle DNF on the picked solve |
+| `i` | inspection countdown on / off |
 | `n` | new scramble |
 | `?` | keys overlay |
 | `q` | quit |
 
-Stats and history are always on screen, so there is nothing to open.
+Stats and history are always on screen, so there is nothing to open. Penalties and
+deletions apply to whichever solve the history cursor is on, so fixing a mis-timed solve
+from ten attempts ago takes two keys.
 
 Options:
 
 ```sh
 ct -p 4x4            # 2x2, 3x3, 4x4 or 5x5 scrambles
 ct -s oh             # a separate session named "oh"
+ct -I                # skip the inspection countdown
 ct --stats           # print stats and exit
 ct --history 50      # print the last 50 solves
 ct --sessions        # list every session
