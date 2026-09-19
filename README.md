@@ -1,14 +1,32 @@
 # cubetimer
 
-A speedcubing timer that lives in your terminal. Scrambles, WCA averages, penalties and
-session history — in one Python file with no dependencies.
+A full-screen speedcubing timer that lives in your terminal. Scrambles, WCA averages,
+penalties and session history — in one Python file with no dependencies.
 
 ```
-scramble  R' L' B' R D2 F2 R2 L' F R' F' U R2 F2 R2 L2 F R B' R
-ao5 9.84   ao12 10.42   best 7.91
-
-   9.62  new PB!
+ ╭─ scramble ───────────────────────────────────────────────────╮
+ │        R F2 B' U2 B' L' B' D L R D' R2 D2 B' D2 U R2 L B L   │
+ ╰──────────────────────────────────────────────────────────────╯
+ ╭─ timer ──────────────────────────────────╮╭─ history ────────╮
+ │                                          ││    1.      9.87  │
+ │      ██████  ██████  ██████  ██████      ││    2.*     8.55  │
+ │      ██  ██  ██  ██      ██  ██          ││    3.     10.02  │
+ │      ██  ██  ██████  ██████  ██████      ││    4.      9.11  │
+ │      ██  ██      ██      ██      ██      ││    5.      9.40+ │
+ │      ██████  ██████  ██████  ██████      ││                  │
+ │                                          ││                  │
+ │           new personal best              ││                  │
+ │      hold space, release to start        ││                  │
+ ╰──────────────────────────────────────────╯│                  │
+ ╭─ stats ──────────────────────────────────╮│                  │
+ │ best         ao5          mo3            ││                  │
+ │ 8.55         9.46         9.51           ││                  │
+ ╰──────────────────────────────────────────╯╰──────────────────╯
 ```
+
+The digits are tabular, so centiseconds never shift the layout while you solve. The panel
+turns red while you hold the space bar and green the moment the timer is armed, the way a
+proper cubing timer behaves.
 
 ## Install
 
@@ -20,38 +38,40 @@ cd cubetimer
 ./cubetimer.py
 ```
 
-To run it from anywhere:
+To run it from anywhere as `ct`, link it into a directory that is already on your `PATH`:
 
 ```sh
-ln -s "$PWD/cubetimer.py" /usr/local/bin/cubetimer
+ln -s "$PWD/cubetimer.py" /opt/homebrew/bin/ct   # Apple silicon
+ln -s "$PWD/cubetimer.py" /usr/local/bin/ct      # Intel macOS, Linux
 ```
+
+It stays a symlink, so `git pull` updates the command too.
 
 ## Use
 
-Press `space` to start the timer, any key to stop. That is the whole loop.
+Hold `space`, release to start, press any key to stop. That is the whole loop.
 
 | Key | Action |
 | --- | --- |
-| `space` | start / stop |
+| `space` | hold, release to start; any key stops |
 | `p` | toggle +2 on the last solve |
 | `d` | toggle DNF on the last solve |
 | `x` | delete the last solve |
-| `s` | session stats |
-| `h` | history (last 20) |
 | `n` | new scramble |
-| `?` | help |
+| `?` | keys overlay |
 | `q` | quit |
+
+Stats and history are always on screen, so there is nothing to open.
 
 Options:
 
 ```sh
-cubetimer -p 4x4            # 2x2, 3x3, 4x4 or 5x5 scrambles
-cubetimer -s oh             # a separate session named "oh"
-cubetimer -i 15             # 15 second WCA inspection
-cubetimer --stats           # print stats and exit
-cubetimer --history 50      # print the last 50 solves
-cubetimer --sessions        # list every session
-cubetimer --export oh.csv   # export a session to CSV
+ct -p 4x4            # 2x2, 3x3, 4x4 or 5x5 scrambles
+ct -s oh             # a separate session named "oh"
+ct --stats           # print stats and exit
+ct --history 50      # print the last 50 solves
+ct --sessions        # list every session
+ct --export oh.csv   # export a session to CSV
 ```
 
 ## Averages

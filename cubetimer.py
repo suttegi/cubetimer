@@ -2,14 +2,12 @@
 """Speedcubing timer for the terminal: scrambles, WCA averages, persistent sessions."""
 
 import argparse
+import curses
 import json
 import os
 import random
-import select
 import sys
-import termios
 import time
-import tty
 from datetime import datetime
 from pathlib import Path
 
@@ -21,13 +19,8 @@ AXIS = {"U": 0, "D": 0, "L": 1, "R": 1, "F": 2, "B": 2}
 SUFFIX = ["", "'", "2"]
 SCRAMBLE_LEN = {"2x2": 11, "3x3": 20, "4x4": 40, "5x5": 60}
 
-BOLD = "\033[1m"
-DIM = "\033[2m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
-RED = "\033[31m"
-CYAN = "\033[36m"
-RESET = "\033[0m"
+HOLD_TO_ARM = 0.40   # how long space must be held before the timer is armed
+RELEASE_GAP = 0.12   # no key repeat for this long means the key came up
 
 
 # --- solve model ---------------------------------------------------------
@@ -73,6 +66,12 @@ def fmt(seconds):
         minutes, rest = divmod(seconds, 60)
         return f"{int(minutes)}:{rest:05.2f}"
     return f"{seconds:.2f}"
+
+
+def fmt_or_dash(value):
+    if value is None:
+        return "—"
+    return fmt(value) if value != DNF else "DNF"
 
 
 # --- statistics ----------------------------------------------------------
@@ -173,8 +172,7 @@ def load(name):
         return []
     try:
         raw = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError) as exc:
-        print(f"{RED}Cannot read {path}: {exc}{RESET}")
+    except (json.JSONDecodeError, OSError):
         return []
     return [Solve.from_dict(d) for d in raw]
 
@@ -186,175 +184,347 @@ def save(name, solves):
     tmp.replace(session_path(name))
 
 
-# --- terminal ------------------------------------------------------------
+# --- big digits ----------------------------------------------------------
+
+# 5-row glyphs. Every glyph is the same width so centiseconds never shift the
+# layout while the timer runs.
+GLYPHS = {
+    "0": ["███", "█ █", "█ █", "█ █", "███"],
+    "1": ["  █", "  █", "  █", "  █", "  █"],
+    "2": ["███", "  █", "███", "█  ", "███"],
+    "3": ["███", "  █", "███", "  █", "███"],
+    "4": ["█ █", "█ █", "███", "  █", "  █"],
+    "5": ["███", "█  ", "███", "  █", "███"],
+    "6": ["███", "█  ", "███", "█ █", "███"],
+    "7": ["███", "  █", "  █", "  █", "  █"],
+    "8": ["███", "█ █", "███", "█ █", "███"],
+    "9": ["███", "█ █", "███", "  █", "███"],
+    ".": ["   ", "   ", "   ", "   ", " █ "],
+    ":": ["   ", " █ ", "   ", " █ ", "   "],
+    "+": ["   ", " █ ", "███", " █ ", "   "],
+    "D": ["██ ", "█ █", "█ █", "█ █", "██ "],
+    "N": ["█ █", "███", "███", "█ █", "█ █"],
+    "F": ["███", "█  ", "██ ", "█  ", "█  "],
+    " ": ["   ", "   ", "   ", "   ", "   "],
+}
 
 
-class RawKeys:
-    """Read single keypresses without echo."""
-
-    def __enter__(self):
-        self.fd = sys.stdin.fileno()
-        self.saved = termios.tcgetattr(self.fd)
-        tty.setcbreak(self.fd)
-        return self
-
-    def __exit__(self, *_):
-        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
-        print("\033[?25h", end="", flush=True)  # cursor back on
-
-    def read(self):
-        return sys.stdin.read(1)
+def big(text, scale=2):
+    """Render text as 5 rows of block glyphs, each cell widened `scale` times."""
+    rows = []
+    for row in range(5):
+        parts = []
+        for char in text:
+            glyph = GLYPHS.get(char, GLYPHS[" "])[row]
+            parts.append("".join(c * scale for c in glyph))
+        rows.append("  ".join(parts))
+    return rows
 
 
-def run_timer(inspection):
-    """Runs one solve: optional inspection, then timing. None if cancelled."""
-    keys = RawKeys.instance
-    if inspection:
-        start = time.monotonic()
-        print(f"{YELLOW}Inspection — space to start, q to cancel{RESET}")
+# --- curses UI -----------------------------------------------------------
+
+C_DIM = 1
+C_ACCENT = 2
+C_GOOD = 3
+C_WARN = 4
+C_BAD = 5
+C_TITLE = 6
+
+
+def init_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(C_DIM, curses.COLOR_WHITE, -1)
+    curses.init_pair(C_ACCENT, curses.COLOR_CYAN, -1)
+    curses.init_pair(C_GOOD, curses.COLOR_GREEN, -1)
+    curses.init_pair(C_WARN, curses.COLOR_YELLOW, -1)
+    curses.init_pair(C_BAD, curses.COLOR_RED, -1)
+    curses.init_pair(C_TITLE, curses.COLOR_MAGENTA, -1)
+
+
+def box(win, top, left, height, width, title="", color=C_DIM):
+    """Draw a rounded panel with a title."""
+    attr = curses.color_pair(color)
+    try:
+        win.addstr(top, left, "╭" + "─" * (width - 2) + "╮", attr)
+        for row in range(1, height - 1):
+            win.addstr(top + row, left, "│", attr)
+            win.addstr(top + row, left + width - 1, "│", attr)
+        win.addstr(top + height - 1, left, "╰" + "─" * (width - 2) + "╯", attr)
+        if title:
+            win.addstr(top, left + 2, f" {title} ", curses.color_pair(C_TITLE) | curses.A_BOLD)
+    except curses.error:
+        pass  # a panel that does not fit is simply clipped
+
+
+def put(win, row, col, text, attr=0):
+    try:
+        win.addstr(row, col, text, attr)
+    except curses.error:
+        pass
+
+
+def centre(win, row, width, text, attr=0, left=0):
+    put(win, row, left + max(0, (width - len(text)) // 2), text, attr)
+
+
+def wrap(text, width):
+    words, lines, line = text.split(), [], ""
+    for word in words:
+        if len(line) + len(word) + 1 > width:
+            lines.append(line)
+            line = word
+        else:
+            line = f"{line} {word}".strip()
+    if line:
+        lines.append(line)
+    return lines
+
+
+class App:
+    def __init__(self, screen, args):
+        self.screen = screen
+        self.args = args
+        self.solves = load(args.session)
+        self.scramble = scramble(args.puzzle)
+        self.state = "idle"        # idle | hold | armed | running
+        self.hold_since = 0.0
+        self.last_space = 0.0
+        self.started = 0.0
+        self.elapsed = 0.0
+        self.message = ""
+        self.show_help = False
+        self.inspection_left = None
+
+    # -- state machine ---------------------------------------------------
+
+    def on_space(self, now):
+        if self.state == "running":
+            self.stop(now)
+        elif self.state == "idle":
+            self.state = "hold"
+            self.hold_since = now
+            self.last_space = now
+            self.message = ""
+        else:
+            self.last_space = now
+
+    def tick(self, now):
+        """Advance hold / release logic between keypresses."""
+        if self.state == "hold" and now - self.hold_since >= HOLD_TO_ARM:
+            self.state = "armed"
+        if self.state in ("hold", "armed") and now - self.last_space >= RELEASE_GAP:
+            if self.state == "armed":
+                self.start(now)
+            else:  # released too early: treat as a tap, so a quick press still works
+                self.start(now)
+
+    def start(self, now):
+        self.state = "running"
+        self.started = now
+        self.elapsed = 0.0
+
+    def stop(self, now):
+        self.elapsed = now - self.started
+        self.state = "idle"
+        solve = Solve(self.elapsed, self.scramble)
+        self.solves.append(solve)
+        save(self.args.session, self.solves)
+        st = session_stats(self.solves)
+        if st["best"] is not None and abs(solve.value - st["best"]) < 1e-9 and len(self.solves) > 1:
+            self.message = "new personal best"
+        else:
+            self.message = ""
+        self.scramble = scramble(self.args.puzzle)
+
+    # -- drawing ---------------------------------------------------------
+
+    def timer_text(self, now):
+        if self.state == "running":
+            return fmt(now - self.started)
+        if self.solves:
+            return self.solves[-1].display()
+        return "0.00"
+
+    def timer_colour(self):
+        return {"hold": C_BAD, "armed": C_GOOD, "running": C_ACCENT}.get(self.state, C_DIM)
+
+    def draw(self, now):
+        screen = self.screen
+        screen.erase()
+        height, width = screen.getmaxyx()
+        if height < 18 or width < 62:
+            put(screen, 0, 0, "Window too small — make it at least 62x18.", curses.color_pair(C_BAD))
+            screen.refresh()
+            return
+
+        st = session_stats(self.solves)
+
+        # header
+        head = f" cubetimer   {self.args.puzzle}   session: {self.args.session} "
+        put(screen, 0, 2, head, curses.color_pair(C_TITLE) | curses.A_BOLD)
+        hint = "? help   q quit "
+        put(screen, 0, width - len(hint) - 2, hint, curses.color_pair(C_DIM) | curses.A_DIM)
+
+        # scramble panel
+        lines = wrap(self.scramble, width - 8)[:2]
+        box(screen, 1, 1, len(lines) + 2, width - 2, "scramble", C_ACCENT)
+        for i, line in enumerate(lines):
+            centre(screen, 2 + i, width - 2, line, curses.color_pair(C_ACCENT) | curses.A_BOLD, 1)
+
+        top = 3 + len(lines)
+        side = 30 if width >= 96 else 0          # history column only on wide terminals
+        main_w = width - 2 - side
+
+        # timer panel
+        timer_h = height - top - 9
+        box(screen, top, 1, timer_h, main_w, "timer", self.timer_colour())
+        scale = 2 if main_w >= 52 else 1
+        digits = big(self.timer_text(now), scale)
+        first = top + max(1, (timer_h - 5) // 2)
+        colour = curses.color_pair(self.timer_colour()) | curses.A_BOLD
+        for i, row in enumerate(digits):
+            if first + i < top + timer_h - 1:
+                centre(screen, first + i, main_w, row, colour, 1)
+
+        status = {
+            "idle": "hold space, release to start",
+            "hold": "keep holding…",
+            "armed": "release to go",
+            "running": "press any key to stop",
+        }[self.state]
+        centre(screen, top + timer_h - 2, main_w, status,
+               curses.color_pair(self.timer_colour()) | curses.A_DIM, 1)
+        if self.message:
+            centre(screen, first + 6, main_w, self.message,
+                   curses.color_pair(C_GOOD) | curses.A_BOLD, 1)
+
+        # stats panel
+        stats_top = top + timer_h
+        box(screen, stats_top, 1, 8, main_w, "stats", C_DIM)
+        col = main_w // 3
+        cells = [
+            ("best", fmt_or_dash(st["best"])), ("ao5", fmt_or_dash(st["ao5"])),
+            ("mo3", fmt_or_dash(st["mo3"])),
+            ("worst", fmt_or_dash(st["worst"])), ("ao12", fmt_or_dash(st["ao12"])),
+            ("ao50", fmt_or_dash(st["ao50"])),
+            ("mean", fmt_or_dash(st["mean"])), ("best ao5", fmt_or_dash(st["best_ao5"])),
+            ("best ao12", fmt_or_dash(st["best_ao12"])),
+        ]
+        for i, (label, value) in enumerate(cells):
+            row = stats_top + 1 + i // 3 * 2
+            left = 3 + (i % 3) * col
+            put(screen, row, left, f"{label:<10}", curses.color_pair(C_DIM) | curses.A_DIM)
+            put(screen, row + 1, left, f"{value:<10}", curses.color_pair(C_GOOD) | curses.A_BOLD)
+        put(screen, stats_top + 6, 3,
+            f"{st['solved']}/{st['count']} solved",
+            curses.color_pair(C_DIM) | curses.A_DIM)
+
+        # history column
+        if side:
+            box(screen, top, width - side - 1, height - top - 1, side, "history", C_DIM)
+            best = st["best"]
+            recent = list(enumerate(self.solves, 1))[-(height - top - 3):]
+            for i, (num, solve) in enumerate(recent):
+                mark = "*" if best is not None and solve.value == best else " "
+                attr = curses.color_pair(C_GOOD) if mark == "*" else curses.color_pair(C_DIM)
+                put(screen, top + 1 + i, width - side + 1,
+                    f"{num:>4}.{mark}{solve.display():>9}", attr)
+
+        if self.show_help:
+            self.draw_help(height, width)
+        screen.refresh()
+
+    def draw_help(self, height, width):
+        rows = [
+            ("space", "hold, then release to start; any key stops"),
+            ("p", "toggle +2 on the last solve"),
+            ("d", "toggle DNF on the last solve"),
+            ("x", "delete the last solve"),
+            ("n", "new scramble"),
+            ("?", "close this help"),
+            ("q", "quit"),
+        ]
+        w, h = 52, len(rows) + 4
+        top, left = (height - h) // 2, (width - w) // 2
+        for row in range(h):  # clear the area behind the panel
+            put(self.screen, top + row, left, " " * w)
+        box(self.screen, top, left, h, w, "keys", C_TITLE)
+        for i, (key, text) in enumerate(rows):
+            put(self.screen, top + 2 + i, left + 3, f"{key:<7}",
+                curses.color_pair(C_ACCENT) | curses.A_BOLD)
+            put(self.screen, top + 2 + i, left + 11, text, curses.color_pair(C_DIM))
+
+    # -- input -----------------------------------------------------------
+
+    def handle(self, key, now):
+        if self.state == "running":
+            self.stop(now)
+            return True
+        if key in (ord(" "),):
+            self.on_space(now)
+        elif key in (ord("q"), 27):
+            return False
+        elif key == ord("?"):
+            self.show_help = not self.show_help
+        elif key in (ord("p"), ord("d")) and self.solves:
+            want = "+2" if key == ord("p") else DNF
+            last = self.solves[-1]
+            last.penalty = "" if last.penalty == want else want
+            save(self.args.session, self.solves)
+        elif key == ord("x") and self.solves:
+            gone = self.solves.pop()
+            save(self.args.session, self.solves)
+            self.message = f"deleted {gone.display()}"
+        elif key == ord("n"):
+            self.scramble = scramble(self.args.puzzle)
+        return True
+
+    def run(self):
+        curses.curs_set(0)
+        self.screen.nodelay(True)
+        init_colors()
         while True:
-            left = inspection - (time.monotonic() - start)
-            if left <= 0:
-                print(f"\r{RED}Inspection over!{RESET}          ")
-                break
-            print(f"\r{YELLOW}{left:4.1f}{RESET} ", end="", flush=True)
-            if select_key(0.05):
-                key = keys.read()
-                if key == "q":
-                    print("\r cancelled        ")
-                    return None
-                break
-        print()
-
-    if inspection:  # after inspection the space is a fresh, deliberate start
-        print(f"{DIM}press space to start{RESET}", end="", flush=True)
-        while keys.read() != " ":
-            pass
-    print(f"\r\033[K{GREEN}GO{RESET}", flush=True)
-    print("\033[?25l", end="")  # hide cursor while running
-
-    start = time.monotonic()
-    while not select_key(0.01):
-        print(f"\r{BOLD}{time.monotonic() - start:7.2f}{RESET}", end="", flush=True)
-    keys.read()
-    elapsed = time.monotonic() - start
-    print("\033[?25h", end="")
-    print(f"\r\033[K", end="")
-    return elapsed
+            now = time.monotonic()
+            key = self.screen.getch()
+            if key != -1:
+                if key == curses.KEY_RESIZE:
+                    continue
+                if not self.handle(key, now):
+                    return
+            self.tick(now)
+            self.draw(now)
+            time.sleep(0.01)
 
 
-def select_key(timeout):
-    return bool(select.select([sys.stdin], [], [], timeout)[0])
+# --- plain-text views (for the non-interactive flags) --------------------
 
 
-# --- views ---------------------------------------------------------------
-
-
-def line(label, value, width=10):
-    text = fmt(value) if isinstance(value, float) else (value or "—")
-    return f"{DIM}{label:<10}{RESET}{text:>{width}}"
-
-
-def show_stats(solves):
+def print_stats(solves):
     st = session_stats(solves)
     if not st["count"]:
-        print(f"{DIM}No solves yet.{RESET}")
+        print("No solves yet.")
         return
-    print(f"\n{BOLD}Session{RESET}  {st['solved']}/{st['count']} solved")
-    print(line("best", st["best"]), "  ", line("worst", st["worst"]))
-    print(line("mean", st["mean"]), "  ", line("mo3", st["mo3"]))
-    print(line("ao5", st["ao5"]), "  ", line("ao12", st["ao12"]))
-    print(line("ao50", st["ao50"]), "  ", line("ao100", st["ao100"]))
-    print(line("best ao5", st["best_ao5"]), "  ", line("best ao12", st["best_ao12"]))
+    print(f"\nSession  {st['solved']}/{st['count']} solved")
+    for label, key in [("best", "best"), ("worst", "worst"), ("mean", "mean"),
+                       ("mo3", "mo3"), ("ao5", "ao5"), ("ao12", "ao12"),
+                       ("ao50", "ao50"), ("ao100", "ao100"),
+                       ("best ao5", "best_ao5"), ("best ao12", "best_ao12")]:
+        print(f"  {label:<10}{fmt_or_dash(st[key]):>10}")
     print()
 
 
-def show_history(solves, limit=20):
+def print_history(solves, limit=20):
     if not solves:
-        print(f"{DIM}No solves yet.{RESET}")
+        print("No solves yet.")
         return
-    print()
-    start = max(0, len(solves) - limit)
     best = min((s.value for s in solves if s.value != DNF), default=None)
-    for i, s in enumerate(solves[start:], start + 1):
-        mark = f" {GREEN}PB{RESET}" if s.value == best and best is not None else ""
-        stamp = s.stamp.split("T")[1] if "T" in s.stamp else ""
-        print(f"{i:>4}. {s.display():>9}{mark}  {DIM}{stamp}  {s.scramble}{RESET}")
-    print()
+    for i, s in enumerate(solves[max(0, len(solves) - limit):], max(1, len(solves) - limit + 1)):
+        mark = " PB" if s.value == best and best is not None else "   "
+        print(f"{i:>4}. {s.display():>9}{mark}  {s.scramble}")
 
 
-def show_help():
-    print(f"""
-{BOLD}Keys{RESET}
-  {CYAN}space{RESET}  start / stop the timer
-  {CYAN}p{RESET}      toggle +2 on the last solve
-  {CYAN}d{RESET}      toggle DNF on the last solve
-  {CYAN}x{RESET}      delete the last solve
-  {CYAN}s{RESET}      session stats
-  {CYAN}h{RESET}      history (last 20)
-  {CYAN}n{RESET}      new scramble
-  {CYAN}?{RESET}      this help
-  {CYAN}q{RESET}      quit
-""")
-
-
-# --- main loop -----------------------------------------------------------
-
-
-def interactive(args):
-    solves = load(args.session)
-    print(f"{BOLD}cubetimer{RESET}  session {CYAN}{args.session}{RESET} · {args.puzzle}"
-          f" · {len(solves)} solve(s) loaded")
-    show_help()
-    current = scramble(args.puzzle)
-
-    with RawKeys() as keys:
-        RawKeys.instance = keys
-        while True:
-            print(f"{BOLD}scramble{RESET}  {current}")
-            st = session_stats(solves)
-            if st["ao5"] is not None:
-                print(f"{DIM}ao5 {fmt(st['ao5']) if st['ao5'] != DNF else 'DNF'}"
-                      f"   ao12 {fmt(st['ao12']) if st['ao12'] not in (None, DNF) else '—'}"
-                      f"   best {fmt(st['best']) if st['best'] else '—'}{RESET}")
-            key = keys.read()
-
-            if key == " ":
-                elapsed = run_timer(args.inspection)
-                if elapsed is None:
-                    continue
-                solve = Solve(elapsed, current)
-                solves.append(solve)
-                save(args.session, solves)
-                st = session_stats(solves)
-                flag = ""
-                if st["best"] is not None and abs(solve.value - st["best"]) < 1e-9:
-                    flag = f"  {GREEN}new PB!{RESET}"
-                print(f"{BOLD}{solve.display()}{RESET}{flag}")
-                if st["ao5"] not in (None, DNF):
-                    print(f"{DIM}ao5 {fmt(st['ao5'])}{RESET}")
-                current = scramble(args.puzzle)
-            elif key in ("p", "d") and solves:
-                want = "+2" if key == "p" else DNF
-                last = solves[-1]
-                last.penalty = "" if last.penalty == want else want
-                save(args.session, solves)
-                print(f"last → {BOLD}{last.display()}{RESET}")
-            elif key == "x" and solves:
-                gone = solves.pop()
-                save(args.session, solves)
-                print(f"{RED}deleted{RESET} {gone.display()}")
-            elif key == "s":
-                show_stats(solves)
-            elif key == "h":
-                show_history(solves)
-            elif key == "n":
-                current = scramble(args.puzzle)
-            elif key == "?":
-                show_help()
-            elif key in ("q", "\x03", "\x04"):
-                print("bye")
-                return
+# --- entry point ---------------------------------------------------------
 
 
 def main():
@@ -362,8 +532,6 @@ def main():
     parser.add_argument("-s", "--session", default="default", help="session name")
     parser.add_argument("-p", "--puzzle", default="3x3", choices=sorted(SCRAMBLE_LEN),
                         help="puzzle type (scramble length)")
-    parser.add_argument("-i", "--inspection", type=float, default=0, metavar="SEC",
-                        help="inspection countdown before each solve, e.g. 15")
     parser.add_argument("--stats", action="store_true", help="print stats and exit")
     parser.add_argument("--history", type=int, nargs="?", const=20, metavar="N",
                         help="print the last N solves and exit")
@@ -374,18 +542,16 @@ def main():
     if args.sessions:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         for path in sorted(DATA_DIR.glob("*.json")):
-            solves = load(path.stem)
-            st = session_stats(solves)
-            best = fmt(st["best"]) if st["best"] else "—"
-            print(f"{path.stem:<16}{st['count']:>4} solves   best {best}")
+            st = session_stats(load(path.stem))
+            print(f"{path.stem:<16}{st['count']:>4} solves   best {fmt_or_dash(st['best'])}")
         return
 
     if args.stats:
-        show_stats(load(args.session))
+        print_stats(load(args.session))
         return
 
     if args.history is not None:
-        show_history(load(args.session), args.history)
+        print_history(load(args.session), args.history)
         return
 
     if args.export:
@@ -400,10 +566,7 @@ def main():
     if not sys.stdin.isatty():
         print("cubetimer needs an interactive terminal.")
         sys.exit(1)
-    try:
-        interactive(args)
-    except KeyboardInterrupt:
-        print("\nbye")
+    curses.wrapper(lambda screen: App(screen, args).run())
 
 
 if __name__ == "__main__":
